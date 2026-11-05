@@ -3,9 +3,9 @@
 # extract_cmcarc_timings.sh
 #
 # Extracts every cmcarc archive in a directory (each into its own folder),
-# finds the Runmod* text file(s) inside, prints the "OMP TIMINGS ON PE #0"
-# section, then draws a bar chart (matplotlib) of the wall clock time of each
-# task, averaged over the cmcarc files that were read.
+# finds the Runmod* text file(s) inside, prints the "OMP_TIMINGS ON PE #0"
+# section written by GEM, then draws a bar chart (matplotlib) of the wall
+# clock time of each task, averaged over the cmcarc files that were read.
 #
 # Usage:
 #   extract_cmcarc_timings.sh [options] DIRECTORY
@@ -13,9 +13,7 @@
 #   -p PATTERN  glob for archive names (default: *.cmcarc)
 #   -o OUTDIR   where extracted content goes (default: DIRECTORY/extracted)
 #   -g FILE     chart image to write (default: OUTDIR/wallclock_average.png)
-#   -c N        use the N-th number on each task row (1 = first, counting any
-#               index/ID numbers) as the wall clock time, instead of locating
-#               it from the "wall" heading of the table
+#   -t          sort the bars by time instead of keeping GEM's task tree order
 #   -s          also open the chart in a window
 #   -n          no chart, only print the timings
 #   -h          help
@@ -28,20 +26,22 @@ set -u
 PATTERN='*.cmcarc'
 OUTDIR=''
 CHART=''
-WALL_COL=''
+SORT_BY_TIME=0
 SHOW=0
 NO_CHART=0
-MARKER='OMP TIMINGS ON PE #0'
 PYTHON="${PYTHON:-python3}"
 
-usage() { sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# GEM writes "OMP_TIMINGS ON PE #0"; also accept a space instead of "_"
+MARKER_RE='OMP[ _]TIMINGS ON PE #0'
 
-while getopts ":p:o:g:c:snh" opt; do
+usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while getopts ":p:o:g:tsnh" opt; do
     case "$opt" in
         p) PATTERN="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
         g) CHART="$OPTARG" ;;
-        c) WALL_COL="$OPTARG" ;;
+        t) SORT_BY_TIME=1 ;;
         s) SHOW=1 ;;
         n) NO_CHART=1 ;;
         h) usage 0 ;;
@@ -62,10 +62,6 @@ if ! command -v cmcarc >/dev/null 2>&1; then
     echo "Error: 'cmcarc' not found in PATH." >&2
     exit 1
 fi
-if [ -n "$WALL_COL" ] && ! [[ "$WALL_COL" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Error: -c expects a positive integer." >&2
-    exit 1
-fi
 
 # Absolute paths, so we can cd around safely
 SRC_DIR="$(cd "$SRC_DIR" && pwd)"
@@ -74,19 +70,19 @@ mkdir -p "$OUTDIR" || exit 1
 OUTDIR="$(cd "$OUTDIR" && pwd)"
 [ -n "$CHART" ] || CHART="$OUTDIR/wallclock_average.png"
 
-# Print the timing block: from the marker line until the first blank line
-# that comes after a line holding numbers (i.e. the end of the table rows),
-# or until another "TIMINGS ON PE" section starts.
+# Print the timing block: the marker line, the task rows, and the closing
+# "_____" line (or stop at a blank line / another TIMINGS section).
 print_timings() {
-    awk -v marker="$MARKER" '
-        index($0, marker) { found = 1; inblock = 1; seen = 0; print; next }
-        inblock && /TIMINGS ON PE/ { inblock = 0 }
+    awk -v re="$MARKER_RE" '
+        !inblock && $0 ~ re { found = 1; inblock = 1; seen = 0; print; next }
         inblock {
-            if ($0 ~ /^[[:space:]]*$/) {
-                if (seen) { inblock = 0; print ""; next }
-            } else if ($0 ~ /[0-9]/) {
-                seen = 1
+            if ($0 ~ /TIMINGS ON PE/)        { inblock = 0; next }
+            if ($0 ~ /^[[:space:]]*$/)       { if (seen) inblock = 0; next }
+            if ($0 ~ /^[[:space:]]*_+[[:space:]]*$/) {
+                if (seen) { print; inblock = 0 }
+                next
             }
+            seen = 1
             print
         }
         END { exit(found ? 0 : 1) }
@@ -131,7 +127,7 @@ for archive in "$SRC_DIR"/$PATTERN; do
                      "${used#$OUTDIR/} is used for the average)"
             fi
         else
-            echo "  (no \"$MARKER\" section in this file)"
+            echo "  (no \"OMP_TIMINGS ON PE #0\" section in this file)"
         fi
         echo
     done < <(find "$dest" -type f -name 'Runmod*' | sort)
@@ -166,14 +162,14 @@ elif ! "$PYTHON" -c 'import matplotlib' >/dev/null 2>&1; then
          "(install it with: $PYTHON -m pip install matplotlib)." >&2
     chart_status=1
 else
-    MARKER="$MARKER" WALL_COL="$WALL_COL" SHOW="$SHOW" CHART="$CHART" \
-    "$PYTHON" - "${TIMING_FILES[@]}" <<'PYEOF'
+    MARKER_RE="$MARKER_RE" SORT_BY_TIME="$SORT_BY_TIME" SHOW="$SHOW" \
+    CHART="$CHART" "$PYTHON" - "${TIMING_FILES[@]}" <<'PYEOF'
 import os
 import re
 import sys
 
-MARKER = os.environ["MARKER"]
-WALL_COL = int(os.environ["WALL_COL"]) if os.environ.get("WALL_COL") else None
+MARKER = re.compile(os.environ["MARKER_RE"])
+SORT_BY_TIME = os.environ.get("SORT_BY_TIME") == "1"
 SHOW = os.environ.get("SHOW") == "1"
 CHART = os.environ["CHART"]
 
@@ -182,126 +178,94 @@ if not SHOW:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-NUM = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][-+]?\d+)?")
-TOKEN = re.compile(r"\S+")
-PUNCT = re.compile(r"^[\[\]():|=]+$")
-
-
-def timing_block(path):
-    """Lines of the marker section, using the same end rule as the shell part."""
-    with open(path, errors="replace") as f:
-        lines = f.read().splitlines()
-    for i, line in enumerate(lines):
-        if MARKER in line:
-            break
-    else:
-        return []
-    block, seen = [], False
-    for line in lines[i + 1:]:
-        if "TIMINGS ON PE" in line:
-            break
-        if not line.strip():
-            if seen:
-                break
-            continue
-        if re.search(r"\d", line):
-            seen = True
-        block.append(line)
-    return block
-
-
-def header_span(block):
-    """(start, end) columns of the 'wall ...' heading, or None."""
-    for line in block:
-        m = re.search(r"wall", line, re.I)
-        if m and not NUM.fullmatch(line.split()[-1] if line.split() else ""):
-            # heading text runs until two consecutive spaces
-            end = line.find("  ", m.start())
-            return m.start(), (len(line) if end < 0 else end)
-    return None
+# A GEM timing row, e.g.
+#  18.72%      .........DYNSTEP ( 10)   Wall clock=  1.278908E+01  count=       14
+ROW = re.compile(
+    r"^\s*[\d.]+%(?P<pad>\s*)\.*(?P<name>[^\s(]+)\s*\(\s*(?P<id>\d+)\s*\)"
+    r"\s+Wall clock=\s*(?P<wall>[-+0-9.EeDd]+)"
+)
 
 
 def parse(path):
-    block = timing_block(path)
-    span = header_span(block)
-    tasks = []           # [(name, seconds)], in file order
-    for line in block:
-        # strip brackets/colons so "[  1]" or "1:" count as plain numbers
-        tokens = [(t.group().strip("[]():,;|"), t.start(), t.end())
-                  for t in TOKEN.finditer(line)]
-        tokens = [t for t in tokens if t[0]]
-        nums = [t for t in tokens if NUM.fullmatch(t[0])]
-        words = [t[0] for t in tokens if t not in nums and not PUNCT.match(t[0])]
-        if not nums or not words or set(line.strip()) <= set("_-=*+ "):
+    """[(key, name, indent_col, seconds)] for the PE #0 table, in file order."""
+    with open(path, errors="replace") as f:
+        lines = f.read().splitlines()
+    start = next((i for i, l in enumerate(lines) if MARKER.search(l)), None)
+    if start is None:
+        return []
+    rows = []
+    for line in lines[start + 1:]:
+        m = ROW.match(line)
+        if not m:
+            if rows:          # first non-row line after the rows ends the table
+                break
             continue
-        if WALL_COL is not None:
-            if WALL_COL > len(nums):
-                continue
-            pick = nums[WALL_COL - 1]
-        elif span is not None:
-            hs, he = span
-            # numeric field closest to (or under) the wall clock heading
-            pick = min(nums, key=lambda t: max(0, hs - t[2], t[1] - he))
-        else:
-            # no heading: first value with a decimal point, else the last value
-            dec = [t for t in nums if "." in t[0]]
-            pick = dec[0] if dec else nums[-1]
-        value = float(pick[0].replace("d", "e").replace("D", "e"))
-        tasks.append((" ".join(words), value))
-    return tasks, span
+        wall = float(m.group("wall").replace("D", "E").replace("d", "e"))
+        key = f"{m.group('name')} ({int(m.group('id'))})"
+        rows.append((key, m.group("name"), m.start("pad") + len(m.group("pad")), wall))
+    return rows
 
 
 per_file = []
 for path in sys.argv[1:]:
-    tasks, span = parse(path)
-    if not tasks:
+    rows = parse(path)
+    if rows:
+        per_file.append(rows)
+    else:
         print(f"  (could not read any task rows from {path})", file=sys.stderr)
-        continue
-    if span is None and WALL_COL is None:
-        print(f"  (no 'wall' heading found in {os.path.basename(path)}; "
-              f"guessed the column - use -c N to choose it)", file=sys.stderr)
-    # make repeated task names unique within one file (name, name #2, ...)
-    count, unique = {}, []
-    for name, val in tasks:
-        count[name] = count.get(name, 0) + 1
-        unique.append((name if count[name] == 1 else f"{name} #{count[name]}", val))
-    per_file.append(unique)
 
 if not per_file:
     print("No task timings could be parsed; no chart.", file=sys.stderr)
     sys.exit(1)
 
 n = len(per_file)
-order, totals, seen_in = [], {}, {}
-for tasks in per_file:
-    for name, val in tasks:
-        if name not in totals:
-            order.append(name)
-            totals[name] = 0.0
-            seen_in[name] = 0
-        totals[name] += val
-        seen_in[name] += 1
+order, names, indent, totals, seen_in = [], {}, {}, {}, {}
+for rows in per_file:
+    for key, name, col, wall in rows:
+        if key not in totals:
+            order.append(key)
+            names[key], indent[key] = name, col
+            totals[key], seen_in[key] = 0.0, 0
+        totals[key] += wall
+        seen_in[key] += 1
 
 # Average over the number of cmcarc files read
-avg = {name: totals[name] / n for name in order}
+avg = {k: totals[k] / n for k in order}
 
-width = max(len(s) for s in order)
+# Nesting level from GEM's indentation (each level is shifted right)
+levels = sorted(set(indent.values()))
+level = {k: levels.index(indent[k]) for k in order}
+label = {k: "  " * level[k] + names[k] for k in order}
+
+width = max(len(label[k]) for k in order) + 6
 print(f"Wall clock time per task, averaged over {n} cmcarc file(s):")
-print(f"  {'TASK'.ljust(width)}  {'AVG WALL (s)':>14}")
-for name in order:
-    note = "" if seen_in[name] == n else f"   (in {seen_in[name]}/{n} files)"
-    print(f"  {name.ljust(width)}  {avg[name]:14.3f}{note}")
+print(f"  {'TASK (ID)'.ljust(width)}  {'AVG WALL (s)':>13}")
+for k in order:
+    tag = f"{label[k]} ({k.rsplit('(', 1)[1]}"
+    note = "" if seen_in[k] == n else f"   (in {seen_in[k]}/{n} files)"
+    print(f"  {tag.ljust(width)}  {avg[k]:13.4f}{note}")
 print()
 
-# Horizontal bars, largest at the top
-names = sorted(order, key=lambda k: avg[k])
-values = [avg[k] for k in names]
-fig, ax = plt.subplots(figsize=(10, max(3.0, 0.32 * len(names) + 1.5)))
-bars = ax.barh(names, values, color="#3b6ea5")
-ax.bar_label(bars, labels=[f"{v:.2f}" for v in values], padding=3, fontsize=8)
+# Horizontal bars; first task (GEMDM) at the top
+keys = sorted(order, key=lambda k: avg[k], reverse=True) if SORT_BY_TIME else order
+keys = list(reversed(keys))           # barh draws bottom-up
+values = [avg[k] for k in keys]
+colors = ["#1f4e79", "#3b6ea5", "#6c9bd2", "#a7c4e5"]
+
+fig, ax = plt.subplots(figsize=(11, max(3.5, 0.28 * len(keys) + 1.6)))
+bars = ax.barh(range(len(keys)), values,
+               color=[colors[min(level[k], len(colors) - 1)] for k in keys])
+ax.set_yticks(range(len(keys)))
+# left-aligned monospace labels so the tree indentation shows
+ax.set_yticklabels([label[k] for k in keys], fontfamily="monospace", fontsize=8,
+                   ha="left")
+ax.tick_params(axis="y", pad=4.9 * max(len(label[k]) for k in keys) + 6)
+ax.bar_label(bars, labels=[f"{v:.3g}" for v in values], padding=3, fontsize=7)
+ax.set_ylim(-0.6, len(keys) - 0.4)
 ax.set_xlabel("Wall clock time (s)")
-ax.set_title(f"Average wall clock time per task ({MARKER}), {n} file(s)")
-ax.margins(x=0.12)
+ax.set_title(f"GEM OMP timings on PE #0: average wall clock time per task "
+             f"({n} cmcarc file{'s' if n != 1 else ''})")
+ax.margins(x=0.08)
 ax.grid(axis="x", alpha=0.3)
 ax.set_axisbelow(True)
 fig.tight_layout()
