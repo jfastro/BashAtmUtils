@@ -180,39 +180,61 @@ import matplotlib.pyplot as plt
 
 # A GEM timing row, e.g.
 #  18.72%      .........DYNSTEP ( 10)   Wall clock=  1.278908E+01  count=       14
+# Only "NAME ( ID ) Wall clock= VALUE" is required; whatever comes before the
+# name (percentage, which can be NaN or ****, and the dots) is ignored.
 ROW = re.compile(
-    r"^\s*[\d.]+%(?P<pad>\s*)\.*(?P<name>[^\s(]+)\s*\(\s*(?P<id>\d+)\s*\)"
-    r"\s+Wall clock=\s*(?P<wall>[-+0-9.EeDd]+)"
+    r"^(?P<lead>.*?)(?P<dots>\.*)(?P<name>[^\s.(][^\s(]*)\s*\(\s*(?P<id>\d+)\s*\)"
+    r"\s*wall\s*clock\s*[=:]\s*(?P<wall>\S+)",
+    re.IGNORECASE,
 )
+END = re.compile(r"^\s*(_+)?\s*$|TIMINGS ON PE")
+
+
+def to_float(text):
+    try:
+        return float(text.replace("D", "E").replace("d", "e"))
+    except ValueError:
+        return None
 
 
 def parse(path):
-    """[(key, name, indent_col, seconds)] for the PE #0 table, in file order."""
+    """([(key, name, indent_col, seconds)], first lines of the section)."""
     with open(path, errors="replace") as f:
-        lines = f.read().splitlines()
+        lines = [l.rstrip("\r\n") for l in f]
     start = next((i for i, l in enumerate(lines) if MARKER.search(l)), None)
     if start is None:
-        return []
+        return [], []
+    section = lines[start:start + 6]
     rows = []
     for line in lines[start + 1:]:
+        line = line.replace("\t", " ").replace("\xa0", " ").rstrip("\r")
         m = ROW.match(line)
         if not m:
-            if rows:          # first non-row line after the rows ends the table
+            if rows and END.search(line):     # end of the table
                 break
             continue
-        wall = float(m.group("wall").replace("D", "E").replace("d", "e"))
+        wall = to_float(m.group("wall"))
+        if wall is None:
+            print(f"  (unreadable wall clock '{m.group('wall')}' for "
+                  f"{m.group('name')} in {os.path.basename(path)}; skipped)",
+                  file=sys.stderr)
+            continue
         key = f"{m.group('name')} ({int(m.group('id'))})"
-        rows.append((key, m.group("name"), m.start("pad") + len(m.group("pad")), wall))
-    return rows
+        rows.append((key, m.group("name"), m.start("dots"), wall))
+    return rows, section
 
 
 per_file = []
 for path in sys.argv[1:]:
-    rows = parse(path)
+    rows, section = parse(path)
     if rows:
         per_file.append(rows)
     else:
         print(f"  (could not read any task rows from {path})", file=sys.stderr)
+        print("   First lines of its timing section (please send these):",
+              file=sys.stderr)
+        for l in section:
+            print(f"   | {l!r}", file=sys.stderr)
 
 if not per_file:
     print("No task timings could be parsed; no chart.", file=sys.stderr)
