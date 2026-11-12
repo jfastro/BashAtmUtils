@@ -9,6 +9,9 @@
 # with error bars of +/- one standard deviation across those files. The input
 # directory is shown in the figure title.
 #
+# A second experiment can be given with -d (and -O for where its archives are
+# extracted); both are then shown in the same figure, in different colours.
+#
 # A Runmod listing can hold several "OMP_TIMINGS ON PE #0" tables (one for the
 # model, one for each I/O server). -T picks the table by its first task.
 #
@@ -19,10 +22,14 @@
 #               it: GEMDM (default), IN-server or OUT-server (case-insensitive)
 #   -p PATTERN  glob for archive names (default: *.ca)
 #   -o OUTDIR   where extracted content goes (default: DIRECTORY/extracted)
+#   -d DIR2     second input directory (second experiment), compared with
+#               DIRECTORY in the same figure
+#   -O OUTDIR2  where DIR2's extracted content goes (default: DIR2/extracted)
 #   -g FILE     chart image to write (default: OUTDIR/wallclock_average.png)
 #   -t          sort the bars by time instead of keeping GEM's task tree order
 #   -N COUNT    show only the COUNT tasks with the largest average wall clock
-#               time in the figure, largest first (implies -t)
+#               time in the figure, largest first (implies -t; with two
+#               experiments a task ranks by the larger of its two averages)
 #   -s          also open the chart in a window
 #   -n          no chart, only print the timings
 #   -h          help
@@ -35,6 +42,8 @@ set -u
 
 PATTERN='*.ca'
 OUTDIR=''
+SRC_DIR2=''
+OUTDIR2=''
 CHART=''
 SORT_BY_TIME=0
 TOP_N=''
@@ -46,13 +55,15 @@ PYTHON="${PYTHON:-python}"
 # Line that starts each timing table (matched as plain text, anywhere in the line)
 MARKER='__________________OMP_TIMINGS ON PE #0_________________________'
 
-usage() { sed -n '3,31p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,39p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-while getopts ":T:p:o:g:N:tsnh" opt; do
+while getopts ":T:p:o:d:O:g:N:tsnh" opt; do
     case "$opt" in
         T) TABLE_TASK="$OPTARG" ;;
         p) PATTERN="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
+        d) SRC_DIR2="$OPTARG" ;;
+        O) OUTDIR2="$OPTARG" ;;
         g) CHART="$OPTARG" ;;
         t) SORT_BY_TIME=1 ;;
         N) TOP_N="$OPTARG" ;;
@@ -70,6 +81,14 @@ SRC_DIR="$1"
 
 if [ ! -d "$SRC_DIR" ]; then
     echo "Error: '$SRC_DIR' is not a directory." >&2
+    exit 1
+fi
+if [ -n "$SRC_DIR2" ] && [ ! -d "$SRC_DIR2" ]; then
+    echo "Error: '$SRC_DIR2' (-d) is not a directory." >&2
+    exit 1
+fi
+if [ -n "$OUTDIR2" ] && [ -z "$SRC_DIR2" ]; then
+    echo "Error: -O is the output directory of the second experiment; it needs -d DIR2." >&2
     exit 1
 fi
 # Normalise the spelling of the known table names; any other name is accepted
@@ -96,6 +115,17 @@ SRC_DIR="$(cd "$SRC_DIR" && pwd)"
 [ -n "$OUTDIR" ] || OUTDIR="$SRC_DIR/extracted"
 mkdir -p "$OUTDIR" || exit 1
 OUTDIR="$(cd "$OUTDIR" && pwd)"
+if [ -n "$SRC_DIR2" ]; then
+    SRC_DIR2="$(cd "$SRC_DIR2" && pwd)"
+    [ -n "$OUTDIR2" ] || OUTDIR2="$SRC_DIR2/extracted"
+    mkdir -p "$OUTDIR2" || exit 1
+    OUTDIR2="$(cd "$OUTDIR2" && pwd)"
+    if [ "$OUTDIR2" = "$OUTDIR" ]; then
+        echo "Error: both experiments would be extracted into $OUTDIR;" \
+             "give them different output directories (-o / -O)." >&2
+        exit 1
+    fi
+fi
 [ -n "$CHART" ] || CHART="$OUTDIR/wallclock_average.png"
 
 # Print the PE #0 timing table whose first task is $TABLE_TASK: the marker
@@ -144,75 +174,106 @@ print_timings() {
     ' "$1"
 }
 
-n_archives=0
 failed=''
-TIMING_FILES=()     # one Runmod file per archive, used for the average
 
-shopt -s nullglob
-for archive in "$SRC_DIR"/$PATTERN; do
-    [ -f "$archive" ] || continue
-    n_archives=$((n_archives + 1))
+# process_dir LABEL SRC OUT
+# Extracts every archive of SRC into OUT/<archive>, prints the timing tables
+# and leaves one Runmod file per archive (the one used for the average) in
+# the global array RESULT_FILES. Returns 1 if SRC holds no matching archive.
+process_dir() {
+    local label="$1" src="$2" out="$3"
+    local n_archives=0 archive name dest found_runmod used runmod rc
+    RESULT_FILES=()
 
-    name="$(basename "$archive")"
-    dest="$OUTDIR/${name%.*}"
-    mkdir -p "$dest"
+    echo "##################################################################"
+    echo "# $label: $src"
+    echo "##################################################################"
 
-    echo "=================================================================="
-    echo "Archive: $name"
-    echo "=================================================================="
+    shopt -s nullglob
+    for archive in "$src"/$PATTERN; do
+        [ -f "$archive" ] || continue
+        n_archives=$((n_archives + 1))
 
-    # cmcarc extracts into the current directory, so run it from $dest
-    if ! ( cd "$dest" && cmcarc -x -f "$archive" ) ; then
-        echo "  !! cmcarc failed on $name" >&2
-        failed="$failed $name"
-        echo
-        continue
-    fi
+        name="$(basename "$archive")"
+        dest="$out/${name%.*}"
+        mkdir -p "$dest"
 
-    found_runmod=0
-    used=''
-    while IFS= read -r runmod; do
-        found_runmod=1
-        echo "--- ${runmod#$OUTDIR/}"
-        print_timings "$runmod"
-        rc=$?
-        if [ "$rc" -eq 0 ]; then
-            if [ -z "$used" ]; then
-                used="$runmod"
-            else
-                echo "  (another Runmod with timings in this archive; only" \
-                     "${used#$OUTDIR/} is used for the average)"
-            fi
-        elif [ "$rc" -eq 1 ]; then
-            echo "  (no \"OMP_TIMINGS ON PE #0\" section in this file)"
+        echo "=================================================================="
+        echo "Archive: $name"
+        echo "=================================================================="
+
+        # cmcarc extracts into the current directory, so run it from $dest
+        if ! ( cd "$dest" && cmcarc -x -f "$archive" ) ; then
+            echo "  !! cmcarc failed on $name" >&2
+            failed="$failed $src/$name"
+            echo
+            continue
         fi
-        echo
-    done < <(find "$dest" -type f -name 'Runmod*' | sort)
 
-    if [ "$found_runmod" -eq 0 ]; then
-        echo "  (no Runmod* file found in this archive)"
-        echo
+        found_runmod=0
+        used=''
+        while IFS= read -r runmod; do
+            found_runmod=1
+            echo "--- ${runmod#$out/}"
+            print_timings "$runmod"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+                if [ -z "$used" ]; then
+                    used="$runmod"
+                else
+                    echo "  (another Runmod with timings in this archive; only" \
+                         "${used#$out/} is used for the average)"
+                fi
+            elif [ "$rc" -eq 1 ]; then
+                echo "  (no \"OMP_TIMINGS ON PE #0\" section in this file)"
+            fi
+            echo
+        done < <(find "$dest" -type f -name 'Runmod*' | sort)
+
+        if [ "$found_runmod" -eq 0 ]; then
+            echo "  (no Runmod* file found in this archive)"
+            echo
+        fi
+        [ -n "$used" ] && RESULT_FILES+=("$used")
+    done
+    shopt -u nullglob
+
+    if [ "$n_archives" -eq 0 ]; then
+        echo "No files matching '$PATTERN' in $src" >&2
+        return 1
     fi
-    [ -n "$used" ] && TIMING_FILES+=("$used")
-done
-shopt -u nullglob
+    echo "Processed $n_archives archive(s). Extracted content is in: $out"
+    echo
+    return 0
+}
 
-if [ "$n_archives" -eq 0 ]; then
-    echo "No files matching '$PATTERN' in $SRC_DIR" >&2
-    exit 1
+if [ -n "$SRC_DIR2" ]; then LABEL1='Experiment 1'; else LABEL1='Input directory'; fi
+
+process_dir "$LABEL1" "$SRC_DIR" "$OUTDIR" || exit 1
+TIMING_FILES1=()
+[ "${#RESULT_FILES[@]}" -gt 0 ] && TIMING_FILES1=("${RESULT_FILES[@]}")
+
+TIMING_FILES2=()
+if [ -n "$SRC_DIR2" ]; then
+    process_dir 'Experiment 2' "$SRC_DIR2" "$OUTDIR2" || exit 1
+    [ "${#RESULT_FILES[@]}" -gt 0 ] && TIMING_FILES2=("${RESULT_FILES[@]}")
 fi
-
-echo "Processed $n_archives archive(s). Extracted content is in: $OUTDIR"
-echo
 
 # ---------------------------------------------------------------------------
 # Average wall clock time per task + bar chart
 # ---------------------------------------------------------------------------
 chart_status=0
+no_table() {
+    echo "No \"OMP_TIMINGS ON PE #0\" table starting with $TABLE_TASK was found" \
+         "in $1, so no chart." >&2
+}
 if [ "$NO_CHART" -eq 1 ]; then
     :
-elif [ "${#TIMING_FILES[@]}" -eq 0 ]; then
-    echo "No \"OMP_TIMINGS ON PE #0\" table starting with $TABLE_TASK was found, so no chart." >&2
+elif [ "${#TIMING_FILES1[@]}" -eq 0 ]; then
+    no_table "$SRC_DIR"
+    chart_status=1
+elif [ -n "$SRC_DIR2" ] && [ "${#TIMING_FILES2[@]}" -eq 0 ]; then
+    no_table "$SRC_DIR2"
     chart_status=1
 elif ! command -v "$PYTHON" >/dev/null 2>&1; then
     echo "'$PYTHON' not found; skipping the chart (set PYTHON, e.g." \
@@ -227,8 +288,15 @@ elif ! "$PYTHON" -c 'import matplotlib' >/dev/null 2>&1; then
          "(install it with: $PYTHON -m pip install matplotlib)." >&2
     chart_status=1
 else
-    MARKER="$MARKER" TABLE_TASK="$TABLE_TASK" SORT_BY_TIME="$SORT_BY_TIME" TOP_N="$TOP_N" SHOW="$SHOW" \
-    CHART="$CHART" SRC_DIR="$SRC_DIR" "$PYTHON" - "${TIMING_FILES[@]}" <<'PYEOF'
+    # Arguments: experiment 1's Runmod files, then (if any) a separator and
+    # experiment 2's Runmod files.
+    args=("${TIMING_FILES1[@]}")
+    if [ -n "$SRC_DIR2" ]; then
+        args+=("--experiment-2--" "${TIMING_FILES2[@]}")
+    fi
+    MARKER="$MARKER" TABLE_TASK="$TABLE_TASK" SORT_BY_TIME="$SORT_BY_TIME" \
+    TOP_N="$TOP_N" SHOW="$SHOW" CHART="$CHART" \
+    SRC_DIR="$SRC_DIR" SRC_DIR2="$SRC_DIR2" "$PYTHON" - "${args[@]}" <<'PYEOF'
 import os
 import re
 import statistics
@@ -240,7 +308,8 @@ SORT_BY_TIME = os.environ.get("SORT_BY_TIME") == "1"
 TOP_N = int(os.environ["TOP_N"]) if os.environ.get("TOP_N") else None
 SHOW = os.environ.get("SHOW") == "1"
 CHART = os.environ["CHART"]
-SRC_DIR = os.environ["SRC_DIR"]
+SRC_DIRS = [d for d in (os.environ["SRC_DIR"], os.environ.get("SRC_DIR2", "")) if d]
+SEPARATOR = "--experiment-2--"
 
 import matplotlib
 if not SHOW:
@@ -305,107 +374,181 @@ def parse(path):
     return [], section, firsts
 
 
-per_file = []
-for path in sys.argv[1:]:
-    rows, section, firsts = parse(path)
-    if rows:
-        per_file.append(rows)
-    elif any(f != "?" for f in firsts):
-        print(f"  (no table starting with {TABLE_TASK} could be read from {path};"
-              f" tables found start with: {', '.join(firsts)})", file=sys.stderr)
-    else:
-        print(f"  (could not read any task rows from {path})", file=sys.stderr)
-        print("   First lines of its timing section (please send these):",
+def load(paths):
+    """Parsed rows of every file that has the wanted table."""
+    per_file = []
+    for path in paths:
+        rows, section, firsts = parse(path)
+        if rows:
+            per_file.append(rows)
+        elif any(f != "?" for f in firsts):
+            print(f"  (no table starting with {TABLE_TASK} could be read from "
+                  f"{path}; tables found start with: {', '.join(firsts)})",
+                  file=sys.stderr)
+        else:
+            print(f"  (could not read any task rows from {path})", file=sys.stderr)
+            print("   First lines of its timing section (please send these):",
+                  file=sys.stderr)
+            for l in section:
+                print(f"   | {l!r}", file=sys.stderr)
+    return per_file
+
+
+def summarise(src_dir, per_file):
+    """Average / standard deviation per task over the files of one experiment."""
+    n = len(per_file)
+    order, names, indent, file_values = [], {}, {}, []
+    for rows in per_file:
+        this = {}
+        for key, name, col, wall in rows:
+            if key not in names:
+                order.append(key)
+                names[key], indent[key] = name, col
+            this[key] = this.get(key, 0.0) + wall
+        file_values.append(this)
+    # one value per cmcarc file read (0 when the task is absent from a file)
+    samples = {k: [fv.get(k, 0.0) for fv in file_values] for k in order}
+    return dict(
+        dir=src_dir, n=n, order=order, names=names, indent=indent,
+        samples=samples,
+        seen_in={k: sum(k in fv for fv in file_values) for k in order},
+        # average over the number of cmcarc files read; error = sample
+        # standard deviation across those files (0 when only one file)
+        avg={k: sum(samples[k]) / n for k in order},
+        std={k: (statistics.stdev(samples[k]) if n > 1 else 0.0) for k in order},
+    )
+
+
+# --- read the experiments -------------------------------------------------
+args = sys.argv[1:]
+groups = ([args[:args.index(SEPARATOR)], args[args.index(SEPARATOR) + 1:]]
+          if SEPARATOR in args else [args])
+exps = []
+for src_dir, paths in zip(SRC_DIRS, groups):
+    per_file = load(paths)
+    if not per_file:
+        print(f"No task timings could be parsed for {src_dir}; no chart.",
               file=sys.stderr)
-        for l in section:
-            print(f"   | {l!r}", file=sys.stderr)
+        sys.exit(1)
+    exps.append(summarise(src_dir, per_file))
+two = len(exps) == 2
 
-if not per_file:
-    print("No task timings could be parsed; no chart.", file=sys.stderr)
-    sys.exit(1)
-
-n = len(per_file)
+# All tasks, in GEM's order (experiment 1 first, then tasks only in exp. 2)
 order, names, indent = [], {}, {}
-file_values = []                      # one {task: seconds} per file
-for rows in per_file:
-    this = {}
-    for key, name, col, wall in rows:
-        if key not in names:
-            order.append(key)
-            names[key], indent[key] = name, col
-        this[key] = this.get(key, 0.0) + wall
-    file_values.append(this)
-
-# Per task: one value per cmcarc file read (0 when the task is absent)
-samples = {k: [fv.get(k, 0.0) for fv in file_values] for k in order}
-seen_in = {k: sum(k in fv for fv in file_values) for k in order}
-
-# Average over the number of cmcarc files read; error = sample standard
-# deviation across those files (0 when only one file was read)
-avg = {k: sum(samples[k]) / n for k in order}
-std = {k: (statistics.stdev(samples[k]) if n > 1 else 0.0) for k in order}
+for e in exps:
+    for k in e["order"]:
+        if k not in names:
+            order.append(k)
+            names[k], indent[k] = e["names"][k], e["indent"][k]
 
 # Nesting level from GEM's indentation (each level is shifted right)
 levels = sorted(set(indent.values()))
 level = {k: levels.index(indent[k]) for k in order}
 label = {k: "  " * level[k] + names[k] for k in order}
 
+# --- text tables ------------------------------------------------------------
 width = max(len(label[k]) for k in order) + 6
-print(f"{TABLE_TASK} table: wall clock time per task, averaged over {n} cmcarc file(s):")
-print(f"Input directory: {SRC_DIR}")
-print(f"  {'TASK (ID)'.ljust(width)}  {'AVG WALL (s)':>13}  {'STD DEV (s)':>12}"
-      f"  {'MIN (s)':>10}  {'MAX (s)':>10}")
-for k in order:
-    tag = f"{label[k]} ({k.rsplit('(', 1)[1]}"
-    note = "" if seen_in[k] == n else f"   (in {seen_in[k]}/{n} files)"
-    print(f"  {tag.ljust(width)}  {avg[k]:13.4f}  {std[k]:12.4f}"
-          f"  {min(samples[k]):10.4f}  {max(samples[k]):10.4f}{note}")
-print()
+for i, e in enumerate(exps, 1):
+    head = f"Experiment {i} - " if two else ""
+    print(f"{head}{TABLE_TASK} table: wall clock time per task, averaged over "
+          f"{e['n']} cmcarc file(s):")
+    print(f"Input directory: {e['dir']}")
+    print(f"  {'TASK (ID)'.ljust(width)}  {'AVG WALL (s)':>13}  {'STD DEV (s)':>12}"
+          f"  {'MIN (s)':>10}  {'MAX (s)':>10}")
+    for k in e["order"]:
+        tag = f"{label[k]} ({k.rsplit('(', 1)[1]}"
+        note = ("" if e["seen_in"][k] == e["n"]
+                else f"   (in {e['seen_in'][k]}/{e['n']} files)")
+        print(f"  {tag.ljust(width)}  {e['avg'][k]:13.4f}  {e['std'][k]:12.4f}"
+              f"  {min(e['samples'][k]):10.4f}  {max(e['samples'][k]):10.4f}{note}")
+    if two:
+        missing = [k for k in order if k not in e["avg"]]
+        if missing:
+            print(f"  (not in this experiment: {', '.join(missing)})")
+    print()
 
-# Horizontal bars; first task (GEMDM) at the top
+# --- which tasks, in which order --------------------------------------------
+def avg_of(e, k):
+    return e["avg"].get(k, 0.0)
+
+rank = {k: max(avg_of(e, k) for e in exps) for k in order}
 if TOP_N is not None:
     # the TOP_N tasks with the largest average wall clock time, largest first
-    keys = sorted(order, key=lambda k: avg[k], reverse=True)[:TOP_N]
+    keys = sorted(order, key=lambda k: rank[k], reverse=True)[:TOP_N]
 elif SORT_BY_TIME:
-    keys = sorted(order, key=lambda k: avg[k], reverse=True)
+    keys = sorted(order, key=lambda k: rank[k], reverse=True)
 else:
     keys = order
 # tree indentation only makes sense in GEM's own order
 tree_order = TOP_N is None and not SORT_BY_TIME
 ylabel = {k: (label[k] if tree_order else names[k]) for k in keys}
 keys = list(reversed(keys))           # barh draws bottom-up
-values = [avg[k] for k in keys]
-errors = [std[k] for k in keys]
-colors = ["#1f4e79", "#3b6ea5", "#6c9bd2", "#a7c4e5"]
 
-fig, ax = plt.subplots(figsize=(11, max(3.5, 0.28 * len(keys) + 1.6)))
-ax.barh(range(len(keys)), values,
-        color=[colors[min(level[k], len(colors) - 1)] for k in keys],
-        xerr=errors, error_kw=dict(ecolor="#333333", elinewidth=0.9,
-                                   capsize=2.5, capthick=0.9))
+# --- figure -------------------------------------------------------------------
+def short(path, limit=100):
+    """Keep the end of very long paths (the most specific part)."""
+    return path if len(path) <= limit else "…" + path[-(limit - 1):]
+
+ERR = dict(ecolor="#333333", elinewidth=0.9, capsize=2.5, capthick=0.9)
+LEVEL_COLORS = ["#1f4e79", "#3b6ea5", "#6c9bd2", "#a7c4e5"]
+EXP_COLORS = ["#2f6db3", "#e0812c"]          # experiment 1 blue, 2 orange
+
+per_task = 0.5 if two else 0.28
+fig, ax = plt.subplots(figsize=(11, max(3.5, per_task * len(keys) + 2.0)))
+height = 0.38 if two else 0.8
+offsets = [0.2, -0.2] if two else [0.0]       # experiment 1 above experiment 2
+
+xmax = max((avg_of(e, k) + e["std"].get(k, 0.0)) for e in exps for k in keys) or 1.0
+for i, (e, off) in enumerate(zip(exps, offsets)):
+    ys = [y + off for y in range(len(keys))]
+    vals = [avg_of(e, k) for k in keys]
+    errs = [e["std"].get(k, 0.0) for k in keys]
+    if two:
+        colors = EXP_COLORS[i]
+        legend = f"Exp {i + 1}: {os.path.basename(e['dir']) or e['dir']} ({e['n']} files)"
+    else:
+        colors = [LEVEL_COLORS[min(level[k], len(LEVEL_COLORS) - 1)] for k in keys]
+        legend = None
+    ax.barh(ys, vals, height=height, color=colors, xerr=errs, error_kw=ERR,
+            label=legend)
+    # value labels just past the end of each error bar
+    for y, k, v, err in zip(ys, keys, vals, errs):
+        if k not in e["avg"]:
+            text = "n/a"
+        else:
+            text = f"{v:.3g} ± {err:.2g}" if e["n"] > 1 else f"{v:.3g}"
+        ax.text(v + err + 0.01 * xmax, y, text, va="center",
+                fontsize=6.5 if two else 7)
+
 ax.set_yticks(range(len(keys)))
 # left-aligned monospace labels so the tree indentation shows
 ax.set_yticklabels([ylabel[k] for k in keys], fontfamily="monospace", fontsize=8,
                    ha="left")
 ax.tick_params(axis="y", pad=4.9 * max(len(ylabel[k]) for k in keys) + 6)
-# value labels just past the end of each error bar
-xmax = max(v + e for v, e in zip(values, errors)) or 1.0
-for y, (v, e) in enumerate(zip(values, errors)):
-    text = f"{v:.3g} ± {e:.2g}" if n > 1 else f"{v:.3g}"
-    ax.text(v + e + 0.01 * xmax, y, text, va="center", fontsize=7)
-ax.set_xlim(0, xmax * 1.18)
+ax.set_xlim(0, xmax * 1.2)
 ax.set_ylim(-0.6, len(keys) - 0.4)
 ax.set_xlabel("Wall clock time (s)")
-plural = "s" if n != 1 else ""
-# keep the end of very long paths (the most specific part) so the title fits
-shown_dir = SRC_DIR if len(SRC_DIR) <= 110 else "…" + SRC_DIR[-109:]
-top_note = (f"top {len(keys)} of {len(order)} tasks, "
+
+top_note = (f"top {len(keys)} of {len(order)} tasks"
             if TOP_N is not None and len(keys) < len(order) else "")
-err_note = ", error bars = ±1 standard deviation" if n > 1 else ""
-ax.set_title(f"GEM OMP timings on PE #0, {TABLE_TASK} table: "
-             f"average wall clock time per task\n"
-             f"Input directory: {shown_dir}\n"
-             f"({top_note}{n} cmcarc file{plural}{err_note})", fontsize=10)
+err_note = ("error bars = ±1 standard deviation"
+            if any(e["n"] > 1 for e in exps) else "")
+title = [f"GEM OMP timings on PE #0, {TABLE_TASK} table: average wall clock time per task"]
+if two:
+    for i, e in enumerate(exps, 1):
+        title.append(f"Exp {i}: {short(e['dir'])} ({e['n']} cmcarc file"
+                     f"{'s' if e['n'] != 1 else ''})")
+    notes = ", ".join(x for x in (top_note, err_note) if x)
+else:
+    e = exps[0]
+    title.append(f"Input directory: {short(e['dir'], 110)}")
+    notes = ", ".join(x for x in (top_note, f"{e['n']} cmcarc file"
+                                  f"{'s' if e['n'] != 1 else ''}", err_note) if x)
+if notes:
+    title.append(f"({notes})")
+ax.set_title("\n".join(title), fontsize=10)
+if two:
+    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
 ax.grid(axis="x", alpha=0.3)
 ax.set_axisbelow(True)
 fig.tight_layout()
