@@ -9,10 +9,15 @@
 # with error bars of +/- one standard deviation across those files. The input
 # directory is shown in the figure title.
 #
+# A Runmod listing can hold several "OMP_TIMINGS ON PE #0" tables (one for the
+# model, one for each I/O server). -T picks the table by its first task.
+#
 # Usage:
 #   extract_cmcarc_timings.sh [options] DIRECTORY
 #
-#   -p PATTERN  glob for archive names (default: *.cmcarc)
+#   -T TASK     which timing table to use, given by the first task listed in
+#               it: GEMDM (default), IN-server or OUT-server (case-insensitive)
+#   -p PATTERN  glob for archive names (default: *.ca)
 #   -o OUTDIR   where extracted content goes (default: DIRECTORY/extracted)
 #   -g FILE     chart image to write (default: OUTDIR/wallclock_average.png)
 #   -t          sort the bars by time instead of keeping GEM's task tree order
@@ -22,27 +27,30 @@
 #   -n          no chart, only print the timings
 #   -h          help
 #
-# Compatible with the bash 3.2 that ships with macOS. Needs python3 + matplotlib
-# for the chart.
+# Compatible with the bash 3.2 that ships with macOS. Needs Python 3 +
+# matplotlib for the chart; the interpreter is "python" unless the PYTHON
+# environment variable names another one (e.g. PYTHON=python3).
 
 set -u
 
-PATTERN='*.cmcarc'
+PATTERN='*.ca'
 OUTDIR=''
 CHART=''
 SORT_BY_TIME=0
 TOP_N=''
+TABLE_TASK='GEMDM'
 SHOW=0
 NO_CHART=0
-PYTHON="${PYTHON:-python3}"
+PYTHON="${PYTHON:-python}"
 
-# GEM writes "OMP_TIMINGS ON PE #0"; also accept a space instead of "_"
-MARKER_RE='OMP[ _]TIMINGS ON PE #0'
+# Line that starts each timing table (matched as plain text, anywhere in the line)
+MARKER='__________________OMP_TIMINGS ON PE #0_________________________'
 
-usage() { sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,31p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-while getopts ":p:o:g:N:tsnh" opt; do
+while getopts ":T:p:o:g:N:tsnh" opt; do
     case "$opt" in
+        T) TABLE_TASK="$OPTARG" ;;
         p) PATTERN="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
         g) CHART="$OPTARG" ;;
@@ -64,6 +72,16 @@ if [ ! -d "$SRC_DIR" ]; then
     echo "Error: '$SRC_DIR' is not a directory." >&2
     exit 1
 fi
+# Normalise the spelling of the known table names; any other name is accepted
+# as is (matching is case-insensitive) in case GEM adds more tables later.
+case "$(printf '%s' "$TABLE_TASK" | tr '[:upper:]' '[:lower:]')" in
+    gemdm)      TABLE_TASK='GEMDM' ;;
+    in-server)  TABLE_TASK='IN-server' ;;
+    out-server) TABLE_TASK='OUT-server' ;;
+    '')         echo "Error: -T needs a task name." >&2; exit 1 ;;
+    *)          echo "Note: '$TABLE_TASK' is not GEMDM, IN-server or OUT-server;" \
+                     "looking for a table that starts with it anyway." >&2 ;;
+esac
 if [ -n "$TOP_N" ] && ! [[ "$TOP_N" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: -N expects a positive integer (got '$TOP_N')." >&2
     exit 1
@@ -80,22 +98,49 @@ mkdir -p "$OUTDIR" || exit 1
 OUTDIR="$(cd "$OUTDIR" && pwd)"
 [ -n "$CHART" ] || CHART="$OUTDIR/wallclock_average.png"
 
-# Print the timing block: the marker line, the task rows, and the closing
-# "_____" line (or stop at a blank line / another TIMINGS section).
+# Print the PE #0 timing table whose first task is $TABLE_TASK: the marker
+# line, the task rows and the closing "_____" line. Each table ends at that
+# line, a blank line, or the next TIMINGS section.
+# Exit status: 0 = printed, 1 = no PE #0 table at all, 3 = PE #0 table(s) but
+# none starting with $TABLE_TASK (a note listing the tables found is printed).
 print_timings() {
-    awk -v re="$MARKER_RE" '
-        !inblock && $0 ~ re { found = 1; inblock = 1; seen = 0; print; next }
+    awk -v marker="$MARKER" -v want="$TABLE_TASK" '
+        function flush(   i) {
+            if (inblock) {
+                ntab++
+                tables = tables (tables == "" ? "" : ", ") (first == "" ? "?" : first)
+                if (!printed && tolower(first) == tolower(want)) {
+                    for (i = 1; i <= nb; i++) print buf[i]
+                    printed = 1
+                }
+            }
+            inblock = 0; nb = 0; first = ""; seen = 0
+        }
+        index($0, marker) { flush(); inblock = 1; nb = 1; buf[1] = $0; next }
         inblock {
-            if ($0 ~ /TIMINGS ON PE/)        { inblock = 0; next }
-            if ($0 ~ /^[[:space:]]*$/)       { if (seen) inblock = 0; next }
+            if ($0 ~ /TIMINGS ON PE/)            { flush(); next }
+            if ($0 ~ /^[[:space:]]*$/)           { if (seen) flush(); next }
             if ($0 ~ /^[[:space:]]*_+[[:space:]]*$/) {
-                if (seen) { print; inblock = 0 }
+                if (seen) { buf[++nb] = $0; flush() }
                 next
             }
+            # first task row: "...NAME ( ID ) Wall clock= ..."
+            if (first == "" && $0 ~ /\([[:space:]]*[0-9]+[[:space:]]*\)[[:space:]]*[Ww][Aa][Ll][Ll]/) {
+                name = $0
+                sub(/[[:space:]]*\([[:space:]]*[0-9]+[[:space:]]*\).*/, "", name)
+                sub(/.*[[:space:].]/, "", name)
+                first = name
+            }
             seen = 1
-            print
+            buf[++nb] = $0
         }
-        END { exit(found ? 0 : 1) }
+        END {
+            flush()
+            if (printed) exit 0
+            if (ntab == 0) exit 1
+            print "  (no PE #0 timing table starting with " want "; tables found start with: " tables ")"
+            exit 3
+        }
     ' "$1"
 }
 
@@ -129,14 +174,16 @@ for archive in "$SRC_DIR"/$PATTERN; do
     while IFS= read -r runmod; do
         found_runmod=1
         echo "--- ${runmod#$OUTDIR/}"
-        if print_timings "$runmod"; then
+        print_timings "$runmod"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
             if [ -z "$used" ]; then
                 used="$runmod"
             else
                 echo "  (another Runmod with timings in this archive; only" \
                      "${used#$OUTDIR/} is used for the average)"
             fi
-        else
+        elif [ "$rc" -eq 1 ]; then
             echo "  (no \"OMP_TIMINGS ON PE #0\" section in this file)"
         fi
         echo
@@ -165,21 +212,30 @@ chart_status=0
 if [ "$NO_CHART" -eq 1 ]; then
     :
 elif [ "${#TIMING_FILES[@]}" -eq 0 ]; then
-    echo "No timing sections found, so no chart." >&2
+    echo "No \"OMP_TIMINGS ON PE #0\" table starting with $TABLE_TASK was found, so no chart." >&2
+    chart_status=1
+elif ! command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "'$PYTHON' not found; skipping the chart (set PYTHON, e.g." \
+         "PYTHON=python3 $0 ...)." >&2
+    chart_status=1
+elif ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 6))' >/dev/null 2>&1; then
+    echo "'$PYTHON' is not Python 3.6 or newer ($("$PYTHON" -V 2>&1));" \
+         "skipping the chart (set PYTHON, e.g. PYTHON=python3 $0 ...)." >&2
     chart_status=1
 elif ! "$PYTHON" -c 'import matplotlib' >/dev/null 2>&1; then
     echo "matplotlib not available for $PYTHON; skipping the chart" \
          "(install it with: $PYTHON -m pip install matplotlib)." >&2
     chart_status=1
 else
-    MARKER_RE="$MARKER_RE" SORT_BY_TIME="$SORT_BY_TIME" TOP_N="$TOP_N" SHOW="$SHOW" \
+    MARKER="$MARKER" TABLE_TASK="$TABLE_TASK" SORT_BY_TIME="$SORT_BY_TIME" TOP_N="$TOP_N" SHOW="$SHOW" \
     CHART="$CHART" SRC_DIR="$SRC_DIR" "$PYTHON" - "${TIMING_FILES[@]}" <<'PYEOF'
 import os
 import re
 import statistics
 import sys
 
-MARKER = re.compile(os.environ["MARKER_RE"])
+MARKER = os.environ["MARKER"]
+TABLE_TASK = os.environ["TABLE_TASK"]
 SORT_BY_TIME = os.environ.get("SORT_BY_TIME") == "1"
 TOP_N = int(os.environ["TOP_N"]) if os.environ.get("TOP_N") else None
 SHOW = os.environ.get("SHOW") == "1"
@@ -210,17 +266,13 @@ def to_float(text):
         return None
 
 
-def parse(path):
-    """([(key, name, indent_col, seconds)], first lines of the section)."""
-    with open(path, errors="replace") as f:
-        lines = [l.rstrip("\r\n") for l in f]
-    start = next((i for i, l in enumerate(lines) if MARKER.search(l)), None)
-    if start is None:
-        return [], []
-    section = lines[start:start + 6]
+def parse_table(path, lines, start):
+    """Rows [(key, name, indent_col, seconds)] of the table at lines[start]."""
     rows = []
     for line in lines[start + 1:]:
         line = line.replace("\t", " ").replace("\xa0", " ").rstrip("\r")
+        if "TIMINGS ON PE" in line:           # next table
+            break
         m = ROW.match(line)
         if not m:
             if rows and END.search(line):     # end of the table
@@ -234,14 +286,33 @@ def parse(path):
             continue
         key = f"{m.group('name')} ({int(m.group('id'))})"
         rows.append((key, m.group("name"), m.start("dots"), wall))
-    return rows, section
+    return rows
+
+
+def parse(path):
+    """(rows of the PE #0 table starting with TABLE_TASK, first lines of
+    that table or of the first PE #0 table, first task of every table)."""
+    with open(path, errors="replace") as f:
+        lines = [l.rstrip("\r\n") for l in f]
+    starts = [i for i, l in enumerate(lines) if MARKER in l]
+    firsts, section = [], lines[starts[0]:starts[0] + 6] if starts else []
+    for start in starts:
+        rows = parse_table(path, lines, start)
+        first = rows[0][1] if rows else "?"
+        firsts.append(first)
+        if first.lower() == TABLE_TASK.lower():
+            return rows, lines[start:start + 6], firsts
+    return [], section, firsts
 
 
 per_file = []
 for path in sys.argv[1:]:
-    rows, section = parse(path)
+    rows, section, firsts = parse(path)
     if rows:
         per_file.append(rows)
+    elif any(f != "?" for f in firsts):
+        print(f"  (no table starting with {TABLE_TASK} could be read from {path};"
+              f" tables found start with: {', '.join(firsts)})", file=sys.stderr)
     else:
         print(f"  (could not read any task rows from {path})", file=sys.stderr)
         print("   First lines of its timing section (please send these):",
@@ -280,7 +351,7 @@ level = {k: levels.index(indent[k]) for k in order}
 label = {k: "  " * level[k] + names[k] for k in order}
 
 width = max(len(label[k]) for k in order) + 6
-print(f"Wall clock time per task, averaged over {n} cmcarc file(s):")
+print(f"{TABLE_TASK} table: wall clock time per task, averaged over {n} cmcarc file(s):")
 print(f"Input directory: {SRC_DIR}")
 print(f"  {'TASK (ID)'.ljust(width)}  {'AVG WALL (s)':>13}  {'STD DEV (s)':>12}"
       f"  {'MIN (s)':>10}  {'MAX (s)':>10}")
@@ -331,7 +402,8 @@ shown_dir = SRC_DIR if len(SRC_DIR) <= 110 else "…" + SRC_DIR[-109:]
 top_note = (f"top {len(keys)} of {len(order)} tasks, "
             if TOP_N is not None and len(keys) < len(order) else "")
 err_note = ", error bars = ±1 standard deviation" if n > 1 else ""
-ax.set_title(f"GEM OMP timings on PE #0: average wall clock time per task\n"
+ax.set_title(f"GEM OMP timings on PE #0, {TABLE_TASK} table: "
+             f"average wall clock time per task\n"
              f"Input directory: {shown_dir}\n"
              f"({top_note}{n} cmcarc file{plural}{err_note})", fontsize=10)
 ax.grid(axis="x", alpha=0.3)
