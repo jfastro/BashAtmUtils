@@ -9,6 +9,12 @@
 # with error bars of +/- one standard deviation across those files. The input
 # directory is shown in the figure title.
 #
+# A directory may also hold Runmod files directly instead of archives: when it
+# contains no file matching PATTERN, every Runmod* file found in it (and its
+# subdirectories) is read as is, one per run, and nothing is extracted. Each
+# input directory is checked on its own, so one experiment can be archives and
+# the other Runmod files.
+#
 # A second experiment can be given with -d (and -O for where its archives are
 # extracted); both are then shown in the same figure, in different colours.
 #
@@ -18,14 +24,18 @@
 # Usage:
 #   extract_cmcarc_timings.sh [options] DIRECTORY
 #
+#   DIRECTORY   cmcarc archives (matching PATTERN), or Runmod* files
+#
 #   -T TASK     which timing table to use, given by the first task listed in
 #               it: GEMDM (default), IN-server or OUT-server (case-insensitive)
 #   -p PATTERN  glob for archive names (default: *.ca)
 #   -o OUTDIR   where extracted content goes (default: DIRECTORY/extracted)
-#   -d DIR2     second input directory (second experiment), compared with
-#               DIRECTORY in the same figure
+#   -d DIR2     second input directory (second experiment: archives or Runmod
+#               files), compared with DIRECTORY in the same figure
 #   -O OUTDIR2  where DIR2's extracted content goes (default: DIR2/extracted)
-#   -g FILE     chart image to write (default: OUTDIR/wallclock_average.png)
+#   -g FILE     chart image to write (default: OUTDIR/wallclock_average.png,
+#               or DIRECTORY/wallclock_average.png when DIRECTORY holds Runmod
+#               files and -o is not given)
 #   -t          sort the bars by time instead of keeping GEM's task tree order
 #   -N COUNT    show only the COUNT tasks with the largest average wall clock
 #               time in the figure, largest first (implies -t; with two
@@ -55,7 +65,7 @@ PYTHON="${PYTHON:-python}"
 # Line that starts each timing table (matched as plain text, anywhere in the line)
 MARKER='__________________OMP_TIMINGS ON PE #0_________________________'
 
-usage() { sed -n '3,39p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,50p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while getopts ":T:p:o:d:O:g:N:tsnh" opt; do
     case "$opt" in
@@ -105,28 +115,67 @@ if [ -n "$TOP_N" ] && ! [[ "$TOP_N" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: -N expects a positive integer (got '$TOP_N')." >&2
     exit 1
 fi
-if ! command -v cmcarc >/dev/null 2>&1; then
-    echo "Error: 'cmcarc' not found in PATH." >&2
-    exit 1
-fi
+# input_mode DIR: "archives" if DIR holds files matching PATTERN, else
+# "runmod" if it holds Runmod* files (at any depth), else "none".
+input_mode() {
+    local f
+    shopt -s nullglob
+    for f in "$1"/$PATTERN; do
+        if [ -f "$f" ]; then shopt -u nullglob; echo archives; return; fi
+    done
+    shopt -u nullglob
+    if [ -n "$(find "$1" -type f -name 'Runmod*' -print 2>/dev/null | head -n 1)" ]; then
+        echo runmod
+    else
+        echo none
+    fi
+}
 
 # Absolute paths, so we can cd around safely
 SRC_DIR="$(cd "$SRC_DIR" && pwd)"
-[ -n "$OUTDIR" ] || OUTDIR="$SRC_DIR/extracted"
-mkdir -p "$OUTDIR" || exit 1
-OUTDIR="$(cd "$OUTDIR" && pwd)"
+MODE1="$(input_mode "$SRC_DIR")"
+MODE2=''
 if [ -n "$SRC_DIR2" ]; then
     SRC_DIR2="$(cd "$SRC_DIR2" && pwd)"
+    MODE2="$(input_mode "$SRC_DIR2")"
+fi
+for pair in "$SRC_DIR:$MODE1" "${SRC_DIR2:+$SRC_DIR2:$MODE2}"; do
+    [ -n "$pair" ] || continue
+    if [ "${pair##*:}" = none ]; then
+        echo "Error: ${pair%:*} has no file matching '$PATTERN' and no Runmod* file." >&2
+        exit 1
+    fi
+done
+if [ "$MODE1" = archives ] || [ "$MODE2" = archives ]; then
+    if ! command -v cmcarc >/dev/null 2>&1; then
+        echo "Error: 'cmcarc' not found in PATH." >&2
+        exit 1
+    fi
+fi
+
+# Output directories: needed to extract archives; for Runmod input only made
+# when given (then they just hold the chart)
+if [ "$MODE1" = archives ] || [ -n "$OUTDIR" ]; then
+    [ -n "$OUTDIR" ] || OUTDIR="$SRC_DIR/extracted"
+    mkdir -p "$OUTDIR" || exit 1
+    OUTDIR="$(cd "$OUTDIR" && pwd)"
+fi
+if [ "$MODE2" = archives ]; then
     [ -n "$OUTDIR2" ] || OUTDIR2="$SRC_DIR2/extracted"
     mkdir -p "$OUTDIR2" || exit 1
     OUTDIR2="$(cd "$OUTDIR2" && pwd)"
-    if [ "$OUTDIR2" = "$OUTDIR" ]; then
+    if [ "$MODE1" = archives ] && [ "$OUTDIR2" = "$OUTDIR" ]; then
         echo "Error: both experiments would be extracted into $OUTDIR;" \
              "give them different output directories (-o / -O)." >&2
         exit 1
     fi
+elif [ -n "$OUTDIR2" ]; then
+    echo "Note: $SRC_DIR2 holds Runmod files, nothing to extract; -O is ignored." >&2
 fi
-[ -n "$CHART" ] || CHART="$OUTDIR/wallclock_average.png"
+if [ -z "$CHART" ]; then
+    if [ -n "$OUTDIR" ]; then CHART="$OUTDIR/wallclock_average.png"
+    else CHART="$SRC_DIR/wallclock_average.png"; fi
+fi
 
 # Print the PE #0 timing table whose first task is $TABLE_TASK: the marker
 # line, the task rows and the closing "_____" line. Each table ends at that
@@ -176,14 +225,50 @@ print_timings() {
 
 failed=''
 
+# process_runmods LABEL SRC
+# Reads the Runmod* files already in SRC (any depth), one per run, prints
+# their timing tables and leaves those that have the wanted table in the
+# global array RESULT_FILES.
+process_runmods() {
+    local label="$1" src="$2" n=0 runmod rc
+    RESULT_FILES=()
+
+    echo "##################################################################"
+    echo "# $label: $src (Runmod files, no extraction)"
+    echo "##################################################################"
+
+    while IFS= read -r runmod; do
+        n=$((n + 1))
+        echo "--- ${runmod#$src/}"
+        print_timings "$runmod"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            RESULT_FILES+=("$runmod")
+        elif [ "$rc" -eq 1 ]; then
+            echo "  (no \"OMP_TIMINGS ON PE #0\" section in this file)"
+        fi
+        echo
+    done < <(find "$src" -type f -name 'Runmod*' | sort)
+
+    echo "Read $n Runmod file(s) from $src"
+    echo
+    return 0
+}
+
 # process_dir LABEL SRC OUT
 # Extracts every archive of SRC into OUT/<archive>, prints the timing tables
 # and leaves one Runmod file per archive (the one used for the average) in
 # the global array RESULT_FILES. Returns 1 if SRC holds no matching archive.
+# A SRC without archives but with Runmod files goes to process_runmods.
 process_dir() {
     local label="$1" src="$2" out="$3"
     local n_archives=0 archive name dest found_runmod used runmod rc
     RESULT_FILES=()
+
+    if [ "$(input_mode "$src")" = runmod ]; then
+        process_runmods "$label" "$src"
+        return
+    fi
 
     echo "##################################################################"
     echo "# $label: $src"
@@ -296,7 +381,8 @@ else
     fi
     MARKER="$MARKER" TABLE_TASK="$TABLE_TASK" SORT_BY_TIME="$SORT_BY_TIME" \
     TOP_N="$TOP_N" SHOW="$SHOW" CHART="$CHART" \
-    SRC_DIR="$SRC_DIR" SRC_DIR2="$SRC_DIR2" "$PYTHON" - "${args[@]}" <<'PYEOF'
+    SRC_DIR="$SRC_DIR" SRC_DIR2="$SRC_DIR2" MODE1="$MODE1" MODE2="$MODE2" \
+    "$PYTHON" - "${args[@]}" <<'PYEOF'
 import os
 import re
 import statistics
@@ -310,6 +396,13 @@ SHOW = os.environ.get("SHOW") == "1"
 CHART = os.environ["CHART"]
 SRC_DIRS = [d for d in (os.environ["SRC_DIR"], os.environ.get("SRC_DIR2", "")) if d]
 SEPARATOR = "--experiment-2--"
+# what one run is in each experiment, for the labels
+KINDS = ["Runmod file" if os.environ.get(m) == "runmod" else "cmcarc file"
+         for m in ("MODE1", "MODE2")]
+
+
+def count(n, kind):
+    return f"{n} {kind}{'s' if n != 1 else ''}"
 
 import matplotlib
 if not SHOW:
@@ -431,6 +524,7 @@ for src_dir, paths in zip(SRC_DIRS, groups):
               file=sys.stderr)
         sys.exit(1)
     exps.append(summarise(src_dir, per_file))
+    exps[-1]["kind"] = KINDS[len(exps) - 1]
 two = len(exps) == 2
 
 # All tasks, in GEM's order (experiment 1 first, then tasks only in exp. 2)
@@ -451,7 +545,7 @@ width = max(len(label[k]) for k in order) + 6
 for i, e in enumerate(exps, 1):
     head = f"Experiment {i} - " if two else ""
     print(f"{head}{TABLE_TASK} table: wall clock time per task, averaged over "
-          f"{e['n']} cmcarc file(s):")
+          f"{count(e['n'], e['kind'])}:")
     print(f"Input directory: {e['dir']}")
     print(f"  {'TASK (ID)'.ljust(width)}  {'AVG WALL (s)':>13}  {'STD DEV (s)':>12}"
           f"  {'MIN (s)':>10}  {'MAX (s)':>10}")
@@ -505,7 +599,7 @@ for i, (e, off) in enumerate(zip(exps, offsets)):
     errs = [e["std"].get(k, 0.0) for k in keys]
     if two:
         colors = EXP_COLORS[i]
-        legend = f"Exp {i + 1}: {os.path.basename(e['dir']) or e['dir']} ({e['n']} files)"
+        legend = f"Exp {i + 1}: {os.path.basename(e['dir']) or e['dir']} ({count(e['n'], e['kind'])})"
     else:
         colors = [LEVEL_COLORS[min(level[k], len(LEVEL_COLORS) - 1)] for k in keys]
         legend = None
@@ -536,14 +630,12 @@ err_note = ("error bars = ±1 standard deviation"
 title = [f"GEM OMP timings on PE #0, {TABLE_TASK} table: average wall clock time per task"]
 if two:
     for i, e in enumerate(exps, 1):
-        title.append(f"Exp {i}: {short(e['dir'])} ({e['n']} cmcarc file"
-                     f"{'s' if e['n'] != 1 else ''})")
+        title.append(f"Exp {i}: {short(e['dir'])} ({count(e['n'], e['kind'])})")
     notes = ", ".join(x for x in (top_note, err_note) if x)
 else:
     e = exps[0]
     title.append(f"Input directory: {short(e['dir'], 110)}")
-    notes = ", ".join(x for x in (top_note, f"{e['n']} cmcarc file"
-                                  f"{'s' if e['n'] != 1 else ''}", err_note) if x)
+    notes = ", ".join(x for x in (top_note, count(e['n'], e['kind']), err_note) if x)
 if notes:
     title.append(f"({notes})")
 ax.set_title("\n".join(title), fontsize=10)
