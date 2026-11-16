@@ -40,6 +40,8 @@
 #   -N COUNT    show only the COUNT tasks with the largest average wall clock
 #               time in the figure, largest first (implies -t; with two
 #               experiments a task ranks by the larger of its two averages)
+#   -m          show the median of each task instead of the mean; error bars
+#               then span the interquartile range (25th to 75th percentile)
 #   -s          also open the chart in a window
 #   -n          no chart, only print the timings
 #   -h          help
@@ -59,15 +61,16 @@ SORT_BY_TIME=0
 TOP_N=''
 TABLE_TASK='GEMDM'
 SHOW=0
+STAT='mean'
 NO_CHART=0
 PYTHON="${PYTHON:-python}"
 
 # Line that starts each timing table (matched as plain text, anywhere in the line)
 MARKER='__________________OMP_TIMINGS ON PE #0_________________________'
 
-usage() { sed -n '3,50p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,51p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-while getopts ":T:p:o:d:O:g:N:tsnh" opt; do
+while getopts ":T:p:o:d:O:g:N:tmsnh" opt; do
     case "$opt" in
         T) TABLE_TASK="$OPTARG" ;;
         p) PATTERN="$OPTARG" ;;
@@ -77,6 +80,7 @@ while getopts ":T:p:o:d:O:g:N:tsnh" opt; do
         g) CHART="$OPTARG" ;;
         t) SORT_BY_TIME=1 ;;
         N) TOP_N="$OPTARG" ;;
+        m) STAT='median' ;;
         s) SHOW=1 ;;
         n) NO_CHART=1 ;;
         h) usage 0 ;;
@@ -380,7 +384,7 @@ else
         args+=("--experiment-2--" "${TIMING_FILES2[@]}")
     fi
     MARKER="$MARKER" TABLE_TASK="$TABLE_TASK" SORT_BY_TIME="$SORT_BY_TIME" \
-    TOP_N="$TOP_N" SHOW="$SHOW" CHART="$CHART" \
+    TOP_N="$TOP_N" SHOW="$SHOW" CHART="$CHART" STAT="$STAT" \
     SRC_DIR="$SRC_DIR" SRC_DIR2="$SRC_DIR2" MODE1="$MODE1" MODE2="$MODE2" \
     "$PYTHON" - "${args[@]}" <<'PYEOF'
 import os
@@ -396,6 +400,8 @@ SHOW = os.environ.get("SHOW") == "1"
 CHART = os.environ["CHART"]
 SRC_DIRS = [d for d in (os.environ["SRC_DIR"], os.environ.get("SRC_DIR2", "")) if d]
 SEPARATOR = "--experiment-2--"
+MEDIAN = os.environ.get("STAT") == "median"
+STAT_WORD = "median" if MEDIAN else "average"
 # what one run is in each experiment, for the labels
 KINDS = ["Runmod file" if os.environ.get(m) == "runmod" else "cmcarc file"
          for m in ("MODE1", "MODE2")]
@@ -487,8 +493,17 @@ def load(paths):
     return per_file
 
 
+def percentile(values, p):
+    """p-th fraction (0..1) of values, linear interpolation between ranks."""
+    v = sorted(values)
+    pos = (len(v) - 1) * p
+    lo = int(pos)
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+
+
 def summarise(src_dir, per_file):
-    """Average / standard deviation per task over the files of one experiment."""
+    """Per-task statistics over the files of one experiment."""
     n = len(per_file)
     order, names, indent, file_values = [], {}, {}, []
     for rows in per_file:
@@ -505,11 +520,25 @@ def summarise(src_dir, per_file):
         dir=src_dir, n=n, order=order, names=names, indent=indent,
         samples=samples,
         seen_in={k: sum(k in fv for fv in file_values) for k in order},
-        # average over the number of cmcarc files read; error = sample
+        # average over the number of files read; error = sample
         # standard deviation across those files (0 when only one file)
         avg={k: sum(samples[k]) / n for k in order},
         std={k: (statistics.stdev(samples[k]) if n > 1 else 0.0) for k in order},
+        med={k: statistics.median(samples[k]) for k in order},
+        q1={k: percentile(samples[k], 0.25) for k in order},
+        q3={k: percentile(samples[k], 0.75) for k in order},
     )
+
+
+def add_plotted(e):
+    """center = value drawn; lo / hi = error bar extent below / above it."""
+    if MEDIAN:
+        e["center"] = e["med"]
+        e["lo"] = {k: e["med"][k] - e["q1"][k] for k in e["order"]}
+        e["hi"] = {k: e["q3"][k] - e["med"][k] for k in e["order"]}
+    else:
+        e["center"] = e["avg"]
+        e["lo"] = e["hi"] = e["std"]
 
 
 # --- read the experiments -------------------------------------------------
@@ -525,6 +554,7 @@ for src_dir, paths in zip(SRC_DIRS, groups):
         sys.exit(1)
     exps.append(summarise(src_dir, per_file))
     exps[-1]["kind"] = KINDS[len(exps) - 1]
+    add_plotted(exps[-1])
 two = len(exps) == 2
 
 # All tasks, in GEM's order (experiment 1 first, then tasks only in exp. 2)
@@ -544,30 +574,41 @@ label = {k: "  " * level[k] + names[k] for k in order}
 width = max(len(label[k]) for k in order) + 6
 for i, e in enumerate(exps, 1):
     head = f"Experiment {i} - " if two else ""
-    print(f"{head}{TABLE_TASK} table: wall clock time per task, averaged over "
+    over = "averaged over" if not MEDIAN else "median over"
+    print(f"{head}{TABLE_TASK} table: wall clock time per task, {over} "
           f"{count(e['n'], e['kind'])}:")
     print(f"Input directory: {e['dir']}")
-    print(f"  {'TASK (ID)'.ljust(width)}  {'AVG WALL (s)':>13}  {'STD DEV (s)':>12}"
-          f"  {'MIN (s)':>10}  {'MAX (s)':>10}")
+    if MEDIAN:
+        cols = ("MEDIAN (s)", "Q1 25% (s)", "Q3 75% (s)")
+    else:
+        cols = ("AVG WALL (s)", "STD DEV (s)", "")
+    print(f"  {'TASK (ID)'.ljust(width)}  {cols[0]:>13}  {cols[1]:>12}"
+          + (f"  {cols[2]:>12}" if cols[2] else "")
+          + f"  {'MIN (s)':>10}  {'MAX (s)':>10}")
     for k in e["order"]:
         tag = f"{label[k]} ({k.rsplit('(', 1)[1]}"
         note = ("" if e["seen_in"][k] == e["n"]
                 else f"   (in {e['seen_in'][k]}/{e['n']} files)")
-        print(f"  {tag.ljust(width)}  {e['avg'][k]:13.4f}  {e['std'][k]:12.4f}"
+        if MEDIAN:
+            stats = (f"{e['med'][k]:13.4f}  {e['q1'][k]:12.4f}  {e['q3'][k]:12.4f}")
+        else:
+            stats = f"{e['avg'][k]:13.4f}  {e['std'][k]:12.4f}"
+        print(f"  {tag.ljust(width)}  {stats}"
               f"  {min(e['samples'][k]):10.4f}  {max(e['samples'][k]):10.4f}{note}")
     if two:
-        missing = [k for k in order if k not in e["avg"]]
+        missing = [k for k in order if k not in e["center"]]
         if missing:
             print(f"  (not in this experiment: {', '.join(missing)})")
     print()
 
 # --- which tasks, in which order --------------------------------------------
 def avg_of(e, k):
-    return e["avg"].get(k, 0.0)
+    """Plotted value (mean, or median with -m); 0 when the task is absent."""
+    return e["center"].get(k, 0.0)
 
 rank = {k: max(avg_of(e, k) for e in exps) for k in order}
 if TOP_N is not None:
-    # the TOP_N tasks with the largest average wall clock time, largest first
+    # the TOP_N tasks with the largest mean (or median) wall clock time
     keys = sorted(order, key=lambda k: rank[k], reverse=True)[:TOP_N]
 elif SORT_BY_TIME:
     keys = sorted(order, key=lambda k: rank[k], reverse=True)
@@ -592,25 +633,30 @@ fig, ax = plt.subplots(figsize=(11, max(3.5, per_task * len(keys) + 2.0)))
 height = 0.38 if two else 0.8
 offsets = [0.2, -0.2] if two else [0.0]       # experiment 1 above experiment 2
 
-xmax = max((avg_of(e, k) + e["std"].get(k, 0.0)) for e in exps for k in keys) or 1.0
+xmax = max((avg_of(e, k) + e["hi"].get(k, 0.0)) for e in exps for k in keys) or 1.0
 for i, (e, off) in enumerate(zip(exps, offsets)):
     ys = [y + off for y in range(len(keys))]
     vals = [avg_of(e, k) for k in keys]
-    errs = [e["std"].get(k, 0.0) for k in keys]
+    lows = [e["lo"].get(k, 0.0) for k in keys]
+    errs = [e["hi"].get(k, 0.0) for k in keys]
     if two:
         colors = EXP_COLORS[i]
         legend = f"Exp {i + 1}: {os.path.basename(e['dir']) or e['dir']} ({count(e['n'], e['kind'])})"
     else:
         colors = [LEVEL_COLORS[min(level[k], len(LEVEL_COLORS) - 1)] for k in keys]
         legend = None
-    ax.barh(ys, vals, height=height, color=colors, xerr=errs, error_kw=ERR,
-            label=legend)
+    ax.barh(ys, vals, height=height, color=colors, xerr=[lows, errs],
+            error_kw=ERR, label=legend)
     # value labels just past the end of each error bar
     for y, k, v, err in zip(ys, keys, vals, errs):
-        if k not in e["avg"]:
+        if k not in e["center"]:
             text = "n/a"
+        elif e["n"] == 1:
+            text = f"{v:.3g}"
+        elif MEDIAN:
+            text = f"{v:.3g} [{e['q1'][k]:.3g}–{e['q3'][k]:.3g}]"
         else:
-            text = f"{v:.3g} ± {err:.2g}" if e["n"] > 1 else f"{v:.3g}"
+            text = f"{v:.3g} ± {err:.2g}"
         ax.text(v + err + 0.01 * xmax, y, text, va="center",
                 fontsize=6.5 if two else 7)
 
@@ -625,9 +671,10 @@ ax.set_xlabel("Wall clock time (s)")
 
 top_note = (f"top {len(keys)} of {len(order)} tasks"
             if TOP_N is not None and len(keys) < len(order) else "")
-err_note = ("error bars = ±1 standard deviation"
-            if any(e["n"] > 1 for e in exps) else "")
-title = [f"GEM OMP timings on PE #0, {TABLE_TASK} table: average wall clock time per task"]
+err_note = ("" if all(e["n"] == 1 for e in exps) else
+            "error bars = interquartile range (25th–75th percentile)" if MEDIAN else
+            "error bars = ±1 standard deviation")
+title = [f"GEM OMP timings on PE #0, {TABLE_TASK} table: {STAT_WORD} wall clock time per task"]
 if two:
     for i, e in enumerate(exps, 1):
         title.append(f"Exp {i}: {short(e['dir'])} ({count(e['n'], e['kind'])})")
