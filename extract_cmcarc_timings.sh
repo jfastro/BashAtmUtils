@@ -21,6 +21,13 @@
 # A Runmod listing can hold several "OMP_TIMINGS ON PE #0" tables (one for the
 # model, one for each I/O server). -T picks the table by its first task.
 #
+# Two table layouts are understood, and can be mixed:
+#   - "OMP_TIMINGS ON PE #0" tables, one "Wall clock=" value per task;
+#   - the "|____ TIMINGS ____|" table of GEM 5.2.9, printed by MPI process
+#     0 (lines prefixed "oe-00000-00000: ") and, in Yin-Yang runs, by the
+#     first process of the Yang panel too. -P picks the process, and -w the
+#     MinSec or MaxSec column of its "Wallclock [Sec]" values.
+#
 # Usage:
 #   extract_cmcarc_timings.sh [options] DIRECTORY
 #
@@ -28,6 +35,11 @@
 #
 #   -T TASK     which timing table to use, given by the first task listed in
 #               it: GEMDM (default), IN-server or OUT-server (case-insensitive)
+#   -P PE       for "|____ TIMINGS" tables: number of the MPI process whose
+#               table is used, from its "oe-XXXXX-<PE>:" prefix (default: 0;
+#               e.g. 884 for the Yang panel of a 1768-process Yin-Yang run)
+#   -w COLUMN   for "|____ TIMINGS" tables: min or max, the MinSec or MaxSec
+#               wall clock column (default: max)
 #   -p PATTERN  glob for archive names (default: *.ca)
 #   -o OUTDIR   where extracted content goes (default: DIRECTORY/extracted)
 #   -d DIR2     second input directory (second experiment: archives or Runmod
@@ -61,6 +73,8 @@ SORT_BY_TIME=0
 TOP_N=''
 TABLE_TASK='GEMDM'
 SHOW=0
+PE_NUM=0
+WALL_COL='max'
 STAT='mean'
 NO_CHART=0
 PYTHON="${PYTHON:-python}"
@@ -68,11 +82,13 @@ PYTHON="${PYTHON:-python}"
 # Line that starts each timing table (matched as plain text, anywhere in the line)
 MARKER='__________________OMP_TIMINGS ON PE #0_________________________'
 
-usage() { sed -n '3,51p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,63p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-while getopts ":T:p:o:d:O:g:N:tmsnh" opt; do
+while getopts ":T:P:w:p:o:d:O:g:N:tmsnh" opt; do
     case "$opt" in
         T) TABLE_TASK="$OPTARG" ;;
+        P) PE_NUM="$OPTARG" ;;
+        w) WALL_COL="$OPTARG" ;;
         p) PATTERN="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
         d) SRC_DIR2="$OPTARG" ;;
@@ -114,6 +130,16 @@ case "$(printf '%s' "$TABLE_TASK" | tr '[:upper:]' '[:lower:]')" in
     '')         echo "Error: -T needs a task name." >&2; exit 1 ;;
     *)          echo "Note: '$TABLE_TASK' is not GEMDM, IN-server or OUT-server;" \
                      "looking for a table that starts with it anyway." >&2 ;;
+esac
+if ! [[ "$PE_NUM" =~ ^[0-9]+$ ]]; then
+    echo "Error: -P expects a process number such as 0 or 884 (got '$PE_NUM')." >&2
+    exit 1
+fi
+PE_NUM=$((10#$PE_NUM))
+case "$(printf '%s' "$WALL_COL" | tr '[:upper:]' '[:lower:]')" in
+    min|minsec) WALL_COL='min' ;;
+    max|maxsec) WALL_COL='max' ;;
+    *) echo "Error: -w expects min or max (got '$WALL_COL')." >&2; exit 1 ;;
 esac
 if [ -n "$TOP_N" ] && ! [[ "$TOP_N" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: -N expects a positive integer (got '$TOP_N')." >&2
@@ -181,13 +207,14 @@ if [ -z "$CHART" ]; then
     else CHART="$SRC_DIR/wallclock_average.png"; fi
 fi
 
-# Print the PE #0 timing table whose first task is $TABLE_TASK: the marker
-# line, the task rows and the closing "_____" line. Each table ends at that
-# line, a blank line, or the next TIMINGS section.
-# Exit status: 0 = printed, 1 = no PE #0 table at all, 3 = PE #0 table(s) but
+# Print the timing table whose first task is $TABLE_TASK: the marker line,
+# the task rows and the closing "_____" line. Each table ends at that line, a
+# blank line, or the next TIMINGS section. Lines carrying an "oe-XXXXX-NNNNN: "
+# prefix (GEM 5.2.9) are used only when NNNNN is $PE_NUM, prefix removed.
+# Exit status: 0 = printed, 1 = no timing table at all, 3 = timing table(s) but
 # none starting with $TABLE_TASK (a note listing the tables found is printed).
 print_timings() {
-    awk -v marker="$MARKER" -v want="$TABLE_TASK" '
+    awk -v marker="$MARKER" -v want="$TABLE_TASK" -v pe="$PE_NUM" '
         function flush(   i) {
             if (inblock) {
                 ntab++
@@ -199,7 +226,16 @@ print_timings() {
             }
             inblock = 0; nb = 0; first = ""; seen = 0
         }
-        index($0, marker) { flush(); inblock = 1; nb = 1; buf[1] = $0; next }
+        # per-process prefix: keep only process pe, without the prefix
+        match($0, /^oe-[0-9]+-[0-9]+: ?/) {
+            num = substr($0, 1, RLENGTH)
+            sub(/^oe-[0-9]+-/, "", num); sub(/: ?$/, "", num)
+            if (num + 0 != pe + 0) next
+            $0 = substr($0, RLENGTH + 1)
+        }
+        index($0, marker) || $0 ~ /^\|_+ TIMINGS _+\|/ {
+            flush(); inblock = 1; nb = 1; buf[1] = $0; next
+        }
         inblock {
             if ($0 ~ /TIMINGS ON PE/)            { flush(); next }
             if ($0 ~ /^[[:space:]]*$/)           { if (seen) flush(); next }
@@ -207,7 +243,14 @@ print_timings() {
                 if (seen) { buf[++nb] = $0; flush() }
                 next
             }
-            # first task row: "...NAME ( ID ) Wall clock= ..."
+            # first task row, GEM 5.2.9 layout: "| ID| NAME | ... |"
+            if (first == "" && $0 ~ /^\|[[:space:]]*[0-9]+\|/) {
+                split($0, fld, "|")
+                name = fld[3]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+                first = name
+            }
+            # first task row, OMP_TIMINGS layout: "...NAME ( ID ) Wall clock= ..."
             if (first == "" && $0 ~ /\([[:space:]]*[0-9]+[[:space:]]*\)[[:space:]]*[Ww][Aa][Ll][Ll]/) {
                 name = $0
                 sub(/[[:space:]]*\([[:space:]]*[0-9]+[[:space:]]*\).*/, "", name)
@@ -221,7 +264,7 @@ print_timings() {
             flush()
             if (printed) exit 0
             if (ntab == 0) exit 1
-            print "  (no PE #0 timing table starting with " want "; tables found start with: " tables ")"
+            print "  (no timing table starting with " want " for PE " pe "; tables found start with: " tables ")"
             exit 3
         }
     ' "$1"
@@ -249,7 +292,7 @@ process_runmods() {
         if [ "$rc" -eq 0 ]; then
             RESULT_FILES+=("$runmod")
         elif [ "$rc" -eq 1 ]; then
-            echo "  (no \"OMP_TIMINGS ON PE #0\" section in this file)"
+            echo "  (no timing table for PE $PE_NUM in this file)"
         fi
         echo
     done < <(find "$src" -type f -name 'Runmod*' | sort)
@@ -314,7 +357,7 @@ process_dir() {
                          "${used#$out/} is used for the average)"
                 fi
             elif [ "$rc" -eq 1 ]; then
-                echo "  (no \"OMP_TIMINGS ON PE #0\" section in this file)"
+                echo "  (no timing table for PE $PE_NUM in this file)"
             fi
             echo
         done < <(find "$dest" -type f -name 'Runmod*' | sort)
@@ -353,7 +396,7 @@ fi
 # ---------------------------------------------------------------------------
 chart_status=0
 no_table() {
-    echo "No \"OMP_TIMINGS ON PE #0\" table starting with $TABLE_TASK was found" \
+    echo "No timing table starting with $TABLE_TASK (PE $PE_NUM) was found" \
          "in $1, so no chart." >&2
 }
 if [ "$NO_CHART" -eq 1 ]; then
@@ -385,6 +428,7 @@ else
     fi
     MARKER="$MARKER" TABLE_TASK="$TABLE_TASK" SORT_BY_TIME="$SORT_BY_TIME" \
     TOP_N="$TOP_N" SHOW="$SHOW" CHART="$CHART" STAT="$STAT" \
+    PE_NUM="$PE_NUM" WALL_COL="$WALL_COL" \
     SRC_DIR="$SRC_DIR" SRC_DIR2="$SRC_DIR2" MODE1="$MODE1" MODE2="$MODE2" \
     "$PYTHON" - "${args[@]}" <<'PYEOF'
 import os
@@ -394,6 +438,8 @@ import sys
 
 MARKER = os.environ["MARKER"]
 TABLE_TASK = os.environ["TABLE_TASK"]
+PE_NUM = int(os.environ.get("PE_NUM", "0"))
+WALL_COL = os.environ.get("WALL_COL", "max")
 SORT_BY_TIME = os.environ.get("SORT_BY_TIME") == "1"
 TOP_N = int(os.environ["TOP_N"]) if os.environ.get("TOP_N") else None
 SHOW = os.environ.get("SHOW") == "1"
@@ -424,7 +470,17 @@ ROW = re.compile(
     r"\s*wall\s*clock\s*[=:]\s*(?P<wall>\S+)",
     re.IGNORECASE,
 )
-END = re.compile(r"^\s*(_+)?\s*$|TIMINGS ON PE")
+# GEM 5.2.9 layout, after the "oe-XXXXX-NNNNN: " prefix is removed:
+# |____ TIMINGS ______________________________|
+# | 10|    DYNSTEP                    | 47.64%:  48.98%| 1.1347E+03 : 1.1665E+03 |    1944|
+NEW_MARKER = re.compile(r"^\|_+ TIMINGS _+\|")
+ROW2 = re.compile(
+    r"^\|\s*(?P<id>\d+)\|(?P<pad> *)(?P<name>\S+)\s*\|[^|]*\|"
+    r"\s*(?P<min>\S+)\s*:\s*(?P<max>\S+)\s*\|"
+)
+PREFIX = re.compile(r"^oe-\d+-(\d+): ?")
+END = re.compile(r"^\s*(_+)?\s*$|TIMINGS ON PE|^\|_+ TIMINGS _+\|")
+FORMATS = set()          # layouts actually used: "omp" and/or "v529"
 
 
 def to_float(text):
@@ -435,41 +491,69 @@ def to_float(text):
 
 
 def parse_table(path, lines, start):
-    """Rows [(key, name, indent_col, seconds)] of the table at lines[start]."""
-    rows = []
+    """Rows [(key, name, indent_col, seconds, id, layout)] of the table at
+    lines[start]."""
+    rows, seen = [], {}
     for line in lines[start + 1:]:
         line = line.replace("\t", " ").replace("\xa0", " ").rstrip("\r")
-        if "TIMINGS ON PE" in line:           # next table
+        if "TIMINGS ON PE" in line or NEW_MARKER.match(line):   # next table
             break
-        m = ROW.match(line)
-        if not m:
+        m2 = ROW2.match(line)
+        m = None if m2 else ROW.match(line)
+        if not (m or m2):
             if rows and END.search(line):     # end of the table
                 break
             continue
-        wall = to_float(m.group("wall"))
+        if m2:
+            raw, col, fmt = m2.group(WALL_COL), m2.start("name"), "v529"
+            m = m2
+        else:
+            raw, col, fmt = m.group("wall"), m.start("dots"), "omp"
+        wall = to_float(raw)
         if wall is None:
-            print(f"  (unreadable wall clock '{m.group('wall')}' for "
+            print(f"  (unreadable wall clock '{raw}' for "
                   f"{m.group('name')} in {os.path.basename(path)}; skipped)",
                   file=sys.stderr)
             continue
-        key = f"{m.group('name')} ({int(m.group('id'))})"
-        rows.append((key, m.group("name"), m.start("dots"), wall))
+        # Tasks are matched by name, ignoring case (GEM versions spell some
+        # timers differently, e.g. PHY_step / PHY_STEP, and renumber IDs).
+        # A name repeated in one table gets " #2", " #3", ...
+        key = m.group("name").upper()
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            key = f"{key} #{seen[key]}"
+        rows.append((key, m.group("name"), col, wall, int(m.group("id")), fmt))
     return rows
 
 
-def parse(path):
-    """(rows of the PE #0 table starting with TABLE_TASK, first lines of
-    that table or of the first PE #0 table, first task of every table)."""
+def read_lines(path):
+    """Lines of the file; "oe-XXXXX-NNNNN: " lines only for PE_NUM, unprefixed."""
+    lines = []
     with open(path, errors="replace") as f:
-        lines = [l.rstrip("\r\n") for l in f]
-    starts = [i for i, l in enumerate(lines) if MARKER in l]
+        for l in f:
+            l = l.rstrip("\r\n")
+            m = PREFIX.match(l)
+            if m:
+                if int(m.group(1)) != PE_NUM:
+                    continue
+                l = l[m.end():]
+            lines.append(l)
+    return lines
+
+
+def parse(path):
+    """(rows of the timing table starting with TABLE_TASK, first lines of
+    that table or of the first timing table, first task of every table)."""
+    lines = read_lines(path)
+    starts = [i for i, l in enumerate(lines) if MARKER in l or NEW_MARKER.match(l)]
     firsts, section = [], lines[starts[0]:starts[0] + 6] if starts else []
     for start in starts:
         rows = parse_table(path, lines, start)
         first = rows[0][1] if rows else "?"
         firsts.append(first)
         if first.lower() == TABLE_TASK.lower():
-            return rows, lines[start:start + 6], firsts
+            FORMATS.update(r[5] for r in rows)
+            return [r[:5] for r in rows], lines[start:start + 8], firsts
     return [], section, firsts
 
 
@@ -505,19 +589,24 @@ def percentile(values, p):
 def summarise(src_dir, per_file):
     """Per-task statistics over the files of one experiment."""
     n = len(per_file)
-    order, names, indent, file_values = [], {}, {}, []
+    order, names, indent, ids, file_values = [], {}, {}, {}, []
     for rows in per_file:
         this = {}
-        for key, name, col, wall in rows:
+        for key, name, col, wall, tid in rows:
             if key not in names:
                 order.append(key)
-                names[key], indent[key] = name, col
+                names[key], indent[key], ids[key] = name, col, tid
             this[key] = this.get(key, 0.0) + wall
         file_values.append(this)
+    # nesting level from GEM's indentation, within this experiment (the two
+    # table layouts indent by different amounts)
+    cols = sorted(set(indent.values()))
+    level = {k: cols.index(indent[k]) for k in order}
     # one value per cmcarc file read (0 when the task is absent from a file)
     samples = {k: [fv.get(k, 0.0) for fv in file_values] for k in order}
     return dict(
-        dir=src_dir, n=n, order=order, names=names, indent=indent,
+        dir=src_dir, n=n, order=order, names=names, indent=indent, ids=ids,
+        level=level,
         samples=samples,
         seen_in={k: sum(k in fv for fv in file_values) for k in order},
         # average over the number of files read; error = sample
@@ -557,17 +646,22 @@ for src_dir, paths in zip(SRC_DIRS, groups):
     add_plotted(exps[-1])
 two = len(exps) == 2
 
-# All tasks, in GEM's order (experiment 1 first, then tasks only in exp. 2)
-order, names, indent = [], {}, {}
+# All tasks, in GEM's tree order: experiment 1's, with each task found only in
+# experiment 2 inserted right after the task that precedes it there
+order, names, level = [], {}, {}
 for e in exps:
+    prev = None
     for k in e["order"]:
         if k not in names:
-            order.append(k)
-            names[k], indent[k] = e["names"][k], e["indent"][k]
+            pos = order.index(prev) + 1 if prev is not None else 0
+            # keep after any earlier insertions that already followed prev
+            while (pos < len(order) and prev is not None
+                   and order[pos] not in e["names"] and level[order[pos]] > e["level"][k]):
+                pos += 1
+            order.insert(pos, k)
+            names[k], level[k] = e["names"][k], e["level"][k]
+        prev = k
 
-# Nesting level from GEM's indentation (each level is shifted right)
-levels = sorted(set(indent.values()))
-level = {k: levels.index(indent[k]) for k in order}
 label = {k: "  " * level[k] + names[k] for k in order}
 
 # --- text tables ------------------------------------------------------------
@@ -586,7 +680,7 @@ for i, e in enumerate(exps, 1):
           + (f"  {cols[2]:>12}" if cols[2] else "")
           + f"  {'MIN (s)':>10}  {'MAX (s)':>10}")
     for k in e["order"]:
-        tag = f"{label[k]} ({k.rsplit('(', 1)[1]}"
+        tag = f"{'  ' * e['level'][k] + e['names'][k]} ({e['ids'][k]})"
         note = ("" if e["seen_in"][k] == e["n"]
                 else f"   (in {e['seen_in'][k]}/{e['n']} files)")
         if MEDIAN:
@@ -598,7 +692,7 @@ for i, e in enumerate(exps, 1):
     if two:
         missing = [k for k in order if k not in e["center"]]
         if missing:
-            print(f"  (not in this experiment: {', '.join(missing)})")
+            print(f"  (not in this experiment: {', '.join(names[k] for k in missing)})")
     print()
 
 # --- which tasks, in which order --------------------------------------------
@@ -620,6 +714,11 @@ ylabel = {k: (label[k] if tree_order else names[k]) for k in keys}
 keys = list(reversed(keys))           # barh draws bottom-up
 
 # --- figure -------------------------------------------------------------------
+def num(v, digits=3):
+    """Compact value label: whole seconds from 1000 s up, else significant digits."""
+    return f"{v:.0f}" if abs(v) >= 1000 else f"{v:.{digits}g}"
+
+
 def short(path, limit=100):
     """Keep the end of very long paths (the most specific part)."""
     return path if len(path) <= limit else "…" + path[-(limit - 1):]
@@ -645,18 +744,20 @@ for i, (e, off) in enumerate(zip(exps, offsets)):
     else:
         colors = [LEVEL_COLORS[min(level[k], len(LEVEL_COLORS) - 1)] for k in keys]
         legend = None
-    ax.barh(ys, vals, height=height, color=colors, xerr=[lows, errs],
+    # no error bars when there is a single run (they would all be zero)
+    ax.barh(ys, vals, height=height, color=colors,
+            xerr=[lows, errs] if e["n"] > 1 else None,
             error_kw=ERR, label=legend)
     # value labels just past the end of each error bar
     for y, k, v, err in zip(ys, keys, vals, errs):
         if k not in e["center"]:
             text = "n/a"
         elif e["n"] == 1:
-            text = f"{v:.3g}"
+            text = num(v)
         elif MEDIAN:
-            text = f"{v:.3g} [{e['q1'][k]:.3g}–{e['q3'][k]:.3g}]"
+            text = f"{num(v)} [{num(e['q1'][k])}–{num(e['q3'][k])}]"
         else:
-            text = f"{v:.3g} ± {err:.2g}"
+            text = f"{num(v)} ± {num(err, 2)}"
         ax.text(v + err + 0.01 * xmax, y, text, va="center",
                 fontsize=6.5 if two else 7)
 
@@ -674,15 +775,19 @@ top_note = (f"top {len(keys)} of {len(order)} tasks"
 err_note = ("" if all(e["n"] == 1 for e in exps) else
             "error bars = interquartile range (25th–75th percentile)" if MEDIAN else
             "error bars = ±1 standard deviation")
-title = [f"GEM OMP timings on PE #0, {TABLE_TASK} table: {STAT_WORD} wall clock time per task"]
+head = ("GEM OMP timings on PE #0" if FORMATS == {"omp"} else f"GEM timings on PE {PE_NUM}")
+title = [f"{head}, {TABLE_TASK} table: {STAT_WORD} wall clock time per task"]
+col_note = (f"{'MaxSec' if WALL_COL == 'max' else 'MinSec'} column"
+            if "v529" in FORMATS else "")
 if two:
     for i, e in enumerate(exps, 1):
         title.append(f"Exp {i}: {short(e['dir'])} ({count(e['n'], e['kind'])})")
-    notes = ", ".join(x for x in (top_note, err_note) if x)
+    notes = ", ".join(x for x in (top_note, col_note, err_note) if x)
 else:
     e = exps[0]
     title.append(f"Input directory: {short(e['dir'], 110)}")
-    notes = ", ".join(x for x in (top_note, count(e['n'], e['kind']), err_note) if x)
+    notes = ", ".join(x for x in (top_note, count(e['n'], e['kind']), col_note, err_note)
+                      if x)
 if notes:
     title.append(f"({notes})")
 ax.set_title("\n".join(title), fontsize=10)
